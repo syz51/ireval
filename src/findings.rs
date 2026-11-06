@@ -1,6 +1,6 @@
 //! `rf.finding/1` records (see the research-factory interface contract).
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -67,10 +67,12 @@ impl Finding {
     }
 
     /// Stamps the time and rewrites paths inside `root` relative to it.
+    /// Subjects naming several runs (`a vs b`, `a, b, c`) have each path
+    /// rewritten.
     pub fn finish(&mut self, at: &str, root: Option<&Path>) {
         self.at = at.to_string();
         if let Some(root) = root {
-            self.subject = relativize(&self.subject, root);
+            self.subject = relativize_subject(&self.subject, root);
             for e in &mut self.evidence {
                 e.path = relativize(&e.path, root);
             }
@@ -88,6 +90,36 @@ impl Finding {
     }
 }
 
+fn relativize_subject(subject: &str, root: &Path) -> String {
+    for sep in [" vs ", ", "] {
+        if subject.contains(sep) {
+            return subject
+                .split(sep)
+                .map(|part| relativize(part, root))
+                .collect::<Vec<_>>()
+                .join(sep);
+        }
+    }
+    relativize(subject, root)
+}
+
+/// Absolute form of `path` with `.` and `..` resolved lexically, so that
+/// `sub/../x` and `x` compare equal (`std::path::absolute` keeps `..`).
+fn normalize(path: &Path) -> Option<PathBuf> {
+    let abs = std::path::absolute(path).ok()?;
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
 /// Rewrites `path` (optionally followed by `:line`) relative to `root` when
 /// it lies inside it.
 fn relativize(subject: &str, root: &Path) -> String {
@@ -97,10 +129,9 @@ fn relativize(subject: &str, root: &Path) -> String {
         }
         _ => (subject, String::new()),
     };
-    let Ok(abs) = std::path::absolute(path) else {
+    let (Some(abs), Some(root)) = (normalize(Path::new(path)), normalize(root)) else {
         return subject.to_string();
     };
-    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     match abs.strip_prefix(&root) {
         Ok(rel) => format!("{}{suffix}", rel.display()),
         Err(_) => subject.to_string(),
@@ -108,17 +139,22 @@ fn relativize(subject: &str, root: &Path) -> String {
 }
 
 /// Current UTC time in RFC 3339 (seconds precision). `SOURCE_DATE_EPOCH`
-/// overrides the clock for reproducible output.
-pub fn now_rfc3339() -> String {
-    let secs = std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64)
-        });
-    rfc3339(secs)
+/// (integer seconds since the Unix epoch) overrides the clock for
+/// reproducible output; a value that is set but not an integer is an error,
+/// as the reproducible-builds specification asks.
+pub fn now_rfc3339() -> Result<String, String> {
+    let secs = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(s) => s.parse::<i64>().map_err(|_| {
+            format!("SOURCE_DATE_EPOCH = {s:?}: expected integer seconds since the Unix epoch")
+        })?,
+        Err(std::env::VarError::NotPresent) => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("SOURCE_DATE_EPOCH is not valid Unicode".into());
+        }
+    };
+    Ok(rfc3339(secs))
 }
 
 pub fn rfc3339(secs: i64) -> String {
@@ -150,6 +186,29 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relativizes_each_path_of_a_subject() {
+        let root = std::env::current_dir().unwrap();
+        let abs = root.join("x/a.run").display().to_string();
+        assert_eq!(relativize_subject(&format!("{abs}:3"), &root), "x/a.run:3");
+        assert_eq!(
+            relativize_subject(&format!("{abs} vs ./y/b.run"), &root),
+            "x/a.run vs y/b.run"
+        );
+        assert_eq!(
+            relativize_subject("sub/../x/a.run, y/b.run", &root),
+            "x/a.run, y/b.run"
+        );
+        assert_eq!(
+            relativize_subject("x/a.run", &root.join("sub/..")),
+            "x/a.run"
+        );
+        assert_eq!(
+            relativize_subject("/elsewhere/a.run", &root),
+            "/elsewhere/a.run"
+        );
+    }
 
     #[test]
     fn formats_utc() {

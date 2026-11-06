@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -235,6 +236,7 @@ fn prepare(
     cfg: &IrevalConfig,
     require_metrics: bool,
 ) -> Result<Prepared> {
+    // An empty `metrics` list in research.toml is rejected when it is loaded.
     let names: Vec<String> = if !common.metrics.is_empty() {
         common.metrics.clone()
     } else if let Some(m) = &cfg.metrics {
@@ -259,14 +261,10 @@ fn prepare(
     let missing = if common.complete {
         Missing::Zero
     } else {
-        match (common.missing, cfg.missing.as_deref()) {
-            (Some(MissingArg::Skip), _) | (None, None | Some("skip")) => Missing::Skip,
-            (Some(MissingArg::Zero), _) | (None, Some("zero")) => Missing::Zero,
-            (None, Some(other)) => {
-                return Err(usage(format!(
-                    "[ireval] missing = {other:?}: expected \"skip\" or \"zero\""
-                )));
-            }
+        match common.missing {
+            Some(MissingArg::Skip) => Missing::Skip,
+            Some(MissingArg::Zero) => Missing::Zero,
+            None => cfg.missing.unwrap_or(Missing::Skip),
         }
     };
     let max_docs = common.max_docs.or(cfg.max_docs);
@@ -342,6 +340,16 @@ fn evaluate_all(p: &Prepared, findings: &mut Vec<Finding>) -> Result<Vec<RunResu
             Some(json!({"count": empty.len(), "relevance_level": level, "qids": eval::first_n(&empty)})),
         ));
     }
+    if p.qrels.queries.contains_key("all") {
+        findings.push(Finding::new(
+            "query-named-all",
+            Severity::Warn,
+            p.qrels.path.clone(),
+            "a query is named \"all\", like the aggregate row of per-query table, CSV and JSON Lines output (as in trec_eval); use --format json to keep them apart".into(),
+            vec![],
+            None,
+        ));
+    }
     p.runs
         .iter()
         .zip(&p.names)
@@ -349,10 +357,24 @@ fn evaluate_all(p: &Prepared, findings: &mut Vec<Finding>) -> Result<Vec<RunResu
         .collect()
 }
 
-fn finish(findings: &mut [Finding], root: Option<&Path>) {
-    let at = now_rfc3339();
+fn finish(findings: &mut [Finding], at: &str, root: Option<&Path>) {
     for f in findings.iter_mut() {
-        f.finish(&at, root);
+        f.finish(at, root);
+    }
+}
+
+/// Writes to stdout. A closed pipe (`ireval ... | head`) ends output quietly
+/// instead of panicking; other write errors are reported.
+fn out(text: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(Error(format!("writing output: {e}")))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -371,11 +393,12 @@ fn exit_for(findings: &[Finding]) -> ExitCode {
 }
 
 fn print_jsonl(findings: &[Finding]) -> Result<()> {
+    let mut text = String::new();
     for f in findings {
-        let line = serde_json::to_string(f).map_err(|e| Error(e.to_string()))?;
-        println!("{line}");
+        text.push_str(&serde_json::to_string(f).map_err(|e| Error(e.to_string()))?);
+        text.push('\n');
     }
-    Ok(())
+    out(&text)
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
@@ -385,6 +408,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
     let cfg = &loaded.config;
     let root = loaded.root.as_deref();
+    let at = now_rfc3339().map_err(usage)?;
     match cli.command {
         Command::Eval {
             common,
@@ -396,31 +420,29 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let p = prepare(&common, &runs, cfg, false)?;
             let mut findings = Vec::new();
             let results = evaluate_all(&p, &mut findings)?;
-            finish(&mut findings, root);
+            finish(&mut findings, &at, root);
             match format {
                 EvalFormat::Table => {
-                    print!(
-                        "{}",
-                        output::eval_table(&results, &p.metrics, per_query, precision)
-                    );
+                    out(&output::eval_table(
+                        &results, &p.metrics, per_query, precision,
+                    ))?;
                     print_findings_text(&findings);
                 }
                 EvalFormat::Csv => {
-                    print!("{}", output::eval_csv(&results, &p.metrics, per_query));
+                    out(&output::eval_csv(&results, &p.metrics, per_query))?;
                     print_findings_text(&findings);
                 }
                 EvalFormat::Json => {
                     let fj = serde_json::to_value(&findings).map_err(|e| Error(e.to_string()))?;
                     let v =
                         output::eval_json(&results, &p.metrics, per_query, settings_json(&p), fj);
-                    println!(
-                        "{}",
+                    out(&format!(
+                        "{}\n",
                         serde_json::to_string_pretty(&v).map_err(|e| Error(e.to_string()))?
-                    );
+                    ))?;
                 }
                 EvalFormat::Jsonl => {
                     let mut all = findings.clone();
-                    let at = now_rfc3339();
                     for r in &results {
                         let mut rows: Vec<(&str, &[f64])> = Vec::new();
                         if per_query {
@@ -469,26 +491,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             precision,
         } => {
             let p = prepare(&common, &runs, cfg, true)?;
-            let primary = match (test, cfg.test.as_deref()) {
-                (Some(TestArg::T), _) | (None, Some("t")) => Primary::T,
-                (Some(TestArg::Randomization), _) | (None, None | Some("randomization")) => {
-                    Primary::Randomization
-                }
-                (None, Some(o)) => {
-                    return Err(usage(format!(
-                        "[ireval] test = {o:?}: expected \"t\" or \"randomization\""
-                    )));
-                }
+            let primary = match test {
+                Some(TestArg::T) => Primary::T,
+                Some(TestArg::Randomization) => Primary::Randomization,
+                None => cfg.test.unwrap_or(Primary::Randomization),
             };
-            let correction = match (correction, cfg.correction.as_deref()) {
-                (Some(CorrectionArg::Holm), _) | (None, None | Some("holm")) => Correction::Holm,
-                (Some(CorrectionArg::Bh), _) | (None, Some("bh")) => Correction::BenjaminiHochberg,
-                (Some(CorrectionArg::None), _) | (None, Some("none")) => Correction::None,
-                (None, Some(o)) => {
-                    return Err(usage(format!(
-                        "[ireval] correction = {o:?}: expected \"holm\", \"bh\" or \"none\""
-                    )));
-                }
+            let correction = match correction {
+                Some(CorrectionArg::Holm) => Correction::Holm,
+                Some(CorrectionArg::Bh) => Correction::BenjaminiHochberg,
+                Some(CorrectionArg::None) => Correction::None,
+                None => cfg.correction.unwrap_or(Correction::Holm),
             };
             let s = CompareSettings {
                 primary,
@@ -512,7 +524,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let mut findings = Vec::new();
             let results = evaluate_all(&p, &mut findings)?;
             let comparisons = compare::compare(&results, &p.metrics, &s, &mut findings);
-            finish(&mut findings, root);
+            finish(&mut findings, &at, root);
             let mut settings = settings_json(&p);
             settings["test"] = json!(match s.primary {
                 Primary::T => "t",
@@ -529,15 +541,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             settings["confidence"] = json!(s.confidence);
             settings["alpha"] = json!(s.alpha);
             settings["rng"] = json!(
-                "xoshiro256++ seeded by splitmix64; stream = splitmix64(seed ^ fnv1a(metric, a, b, test))"
+                "xoshiro256++ seeded by splitmix64; stream = splitmix64(seed ^ fnv1a(fnv1a(metric, paired qids and values), test))"
             );
             match format {
                 EvalFormat::Table => {
-                    print!("{}", output::compare_table(&comparisons, precision));
+                    out(&output::compare_table(&comparisons, precision))?;
                     print_findings_text(&findings);
                 }
                 EvalFormat::Csv => {
-                    print!("{}", output::compare_csv(&comparisons));
+                    out(&output::compare_csv(&comparisons))?;
                     print_findings_text(&findings);
                 }
                 EvalFormat::Json => {
@@ -548,19 +560,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         "comparisons": comparisons.iter().map(output::comparison_json).collect::<Vec<_>>(),
                         "findings": serde_json::to_value(&findings).map_err(|e| Error(e.to_string()))?,
                     });
-                    println!(
-                        "{}",
+                    out(&format!(
+                        "{}\n",
                         serde_json::to_string_pretty(&v).map_err(|e| Error(e.to_string()))?
-                    );
+                    ))?;
                 }
                 EvalFormat::Jsonl => {
                     let mut all = findings.clone();
-                    let at = now_rfc3339();
                     for c in &comparisons {
                         let mut f = Finding::new(
                             "comparison",
                             Severity::Info,
-                            format!("{} vs {}", c.a, c.b),
+                            format!("{} vs {}", c.a_path, c.b_path),
                             format!(
                                 "{}: diff {} (p_adj {}, n {})",
                                 c.metric,
@@ -597,12 +608,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     );
                 }
             }
-            finish(&mut findings, root);
+            finish(&mut findings, &at, root);
             match format {
                 CheckFormat::Text => {
-                    for f in &findings {
-                        println!("{}", f.to_text());
-                    }
+                    let text: String = findings.iter().map(|f| f.to_text() + "\n").collect();
+                    out(&text)?;
                 }
                 CheckFormat::Jsonl => print_jsonl(&findings)?,
             }

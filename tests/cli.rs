@@ -11,13 +11,19 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn ireval(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ireval"))
-        .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+/// Runs the binary from the crate root with an explicit, empty config, so a
+/// research.toml in a directory above the checkout cannot change results.
+/// Finding paths are relative to that config's directory, tests/fixtures/cli.
+fn command() -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_ireval"));
+    c.current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("SOURCE_DATE_EPOCH", "1794020400")
-        .output()
-        .unwrap()
+        .args(["--config", "tests/fixtures/cli/research.toml"]);
+    c
+}
+
+fn ireval(args: &[&str]) -> Output {
+    command().args(args).output().unwrap()
 }
 
 fn stdout(o: &Output) -> String {
@@ -113,7 +119,36 @@ fn duplicates_are_refused_like_trec_eval() {
     assert_eq!(dup["tool"], "ireval");
     assert_eq!(dup["severity"], "error");
     assert_eq!(dup["at"], "2026-11-07T03:00:00Z");
-    assert_eq!(dup["subject"], "tests/fixtures/cli/run_dup.txt:3");
+    assert_eq!(dup["subject"], "run_dup.txt:3");
+}
+
+#[test]
+fn check_reports_duplicates_in_unjudged_queries() {
+    let dir = std::env::temp_dir().join(format!("ireval-dupx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = dir.join("dupx.run");
+    std::fs::write(
+        &run,
+        "q1 Q0 d1 1 1.0 t\nq9 Q0 d5 1 1.0 t\nq9 Q0 d5 2 0.5 t\n",
+    )
+    .unwrap();
+    let run = run.to_str().unwrap();
+    // eval accepts the run, as trec_eval does, but reports the duplicate.
+    let o = ireval(&["eval", "-m", "P@1", Q, run]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("warn[run-duplicate-doc]"),
+        "{}",
+        stderr(&o)
+    );
+    let o = ireval(&["check", Q, run]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stdout(&o).contains("error[run-duplicate-doc]"),
+        "{}",
+        stdout(&o)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -217,8 +252,45 @@ fn input_errors_exit_2_with_location() {
     std::fs::create_dir_all(&dir).unwrap();
     let run = dir.join("other.run");
     std::fs::write(&run, "zz Q0 d1 1 1.0 t\n").unwrap();
-    let o = ireval(&["eval", Q, run.to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(2));
-    assert!(stderr(&o).contains("no query has both results and judgments"));
+    for missing in ["skip", "zero"] {
+        let o = ireval(&["eval", "--missing", missing, Q, run.to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(2), "{missing}");
+        assert!(stderr(&o).contains("no query has both results and judgments"));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
+    // A malformed SOURCE_DATE_EPOCH is an error, not a silent fallback.
+    let o = command()
+        .env("SOURCE_DATE_EPOCH", "1794020400.0")
+        .args(["eval", Q, A])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(stderr(&o).contains("SOURCE_DATE_EPOCH"));
+}
+
+#[test]
+fn closed_stdout_ends_output_without_a_panic() {
+    // Enough output to fill a pipe buffer, read by nobody.
+    let dir = std::env::temp_dir().join(format!("ireval-pipe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut q, mut r) = (String::new(), String::new());
+    for i in 0..5000 {
+        q.push_str(&format!("q{i} 0 d1 1\n"));
+        r.push_str(&format!("q{i} Q0 d1 1 1.0 t\nq{i} Q0 d2 2 0.5 t\n"));
+    }
+    std::fs::write(dir.join("q.txt"), q).unwrap();
+    std::fs::write(dir.join("r.run"), r).unwrap();
+    let mut child = command()
+        .args(["eval", "-q", "--format", "csv"])
+        .arg(dir.join("q.txt"))
+        .arg(dir.join("r.run"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let o = child.wait_with_output().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(o.status.success(), "{:?}: {}", o.status, stderr(&o));
+    assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
 }

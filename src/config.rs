@@ -4,20 +4,23 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::compare::Primary;
+use crate::eval::Missing;
 use crate::input::{Error, Result};
+use crate::stats::Correction;
 
-/// Values from the `[ireval]` table. Every field is optional; command-line
-/// flags override them.
+/// Values from the `[ireval]` table, validated when the file is loaded. Every
+/// field is optional; command-line flags override them.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct IrevalConfig {
     pub metrics: Option<Vec<String>>,
     pub cutoffs: Option<Vec<usize>>,
     pub relevance_level: Option<i64>,
-    pub missing: Option<String>,
+    pub missing: Option<Missing>,
     pub max_docs: Option<usize>,
-    pub test: Option<String>,
-    pub correction: Option<String>,
+    pub test: Option<Primary>,
+    pub correction: Option<Correction>,
     pub seed: Option<u64>,
     pub trials: Option<u64>,
     pub bootstrap: Option<u64>,
@@ -113,6 +116,12 @@ pub fn load(explicit: Option<&Path>) -> Result<Loaded> {
         .clone()
         .try_into()
         .map_err(|e| Error(format!("{}: [ireval]: {e}", path.display())))?;
+    if config.metrics.as_ref().is_some_and(Vec::is_empty) {
+        return Err(Error(format!(
+            "{}: [ireval]: `metrics` is empty; list at least one metric or remove the key",
+            path.display()
+        )));
+    }
     Ok(Loaded {
         root,
         config,
@@ -136,9 +145,24 @@ mod tests {
         .unwrap();
         let loaded = load(Some(&path)).unwrap();
         assert_eq!(loaded.config.seed, Some(7));
+        assert_eq!(
+            loaded.config.correction,
+            Some(Correction::BenjaminiHochberg)
+        );
         assert_eq!(loaded.config.cutoffs, Some(vec![5, 10]));
         assert_eq!(loaded.unknown_keys, ["future_key"]);
         assert_eq!(discover(&dir).as_deref(), Some(path.as_path()));
+        // Invalid values fail at load, whichever subcommand runs.
+        for bad in [
+            "correction='bonferroni'",
+            "test='wilcoxon'",
+            "missing='drop'",
+            "metrics=[]",
+        ] {
+            std::fs::write(&path, format!("[ireval]\n{bad}\n")).unwrap();
+            let e = load(Some(&path)).unwrap_err();
+            assert!(e.0.contains("[ireval]"), "{bad}: {e}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,0 +1,2 @@
+# Empty configuration for the CLI tests: an explicit --config keeps any
+# research.toml above the checkout from changing their results.

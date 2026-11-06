@@ -22,7 +22,7 @@ ireval check --format jsonl qrels.txt *.run               # findings only; exit 
 | Run | `qid Q0 docid rank score tag` | `{"qid": "q1", "docid": "d7", "score": 12.5}` (optional `"tag"`) |
 
 - The format is detected from the first record (`{` means JSON Lines). `--qrels-format` and `--run-format` override the detection.
-- TREC fields are separated by whitespace. Blank lines and lines starting with `#` are skipped.
+- TREC fields are separated by whitespace. Blank lines and lines starting with `#` are skipped, and a leading UTF-8 byte order mark is ignored.
 - In JSON, `qid` and `docid` may be strings or integers, and unknown fields are ignored.
 - The `iter`, `Q0` and `rank` columns are ignored, as in `trec_eval`: ranks always come from the scores.
 - `rel` must be an integer. A score that is not a number, or is NaN, is an error.
@@ -43,9 +43,9 @@ ireval check --format jsonl qrels.txt *.run               # findings only; exit 
 | `skip` (default) | Queries present in both the qrels and the run | `trec_eval` default |
 | `zero` (`-c`) | Every qrels query. A query absent from the run is evaluated as an empty ranking: 0 on every metric except NumRel. | `trec_eval -c` |
 
-In both modes, queries in a run but not in the qrels are ignored and reported. A qrels query with no relevant document is still averaged in, as `trec_eval` does, and is reported (`query-without-relevant`). A run that shares no query with the qrels is an error.
+In both modes, queries in a run but not in the qrels are ignored and reported. A qrels query with no relevant document is still averaged in, as `trec_eval` does, and is reported (`query-without-relevant`). A run that shares no query with the qrels is an error in both modes (exit 2), as in `trec_eval` 9.0.8, which stops with "No queries with both results and relevance info" even under `-c`.
 
-**Duplicates.** A document listed twice for one query makes `trec_eval` abort, and `ireval` refuses the run the same way (exit 2, naming both lines). `--duplicates first` keeps the higher-ranked copy and reports a `run-duplicate-doc` finding.
+**Duplicates.** A document listed twice for one query makes `trec_eval` abort, and `ireval` refuses the run the same way (exit 2, naming both lines). `--duplicates first` keeps the higher-ranked copy and reports a `run-duplicate-doc` finding. Like `trec_eval`, which checks only the queries it evaluates, `ireval` accepts duplicates in run queries that have no judgments; they are reported as a `run-duplicate-doc` warning with `evaluated: false`.
 
 **Aggregation.** Over the query set, metrics are averaged and the counts NumRet, NumRel, NumRelRet and NumQ are summed. Both rules are `trec_eval`'s.
 
@@ -93,14 +93,14 @@ Names are case-insensitive. Output uses the first name in each row.
 | Output | Definition | Checked against |
 | --- | --- | --- |
 | `diff` | `mean(d)` | NumPy |
-| `cohens_d` | `mean(d) / sd(d)` with `n − 1` (d_z, Cohen's d for paired samples). Undefined (null) when `sd = 0`. | NumPy |
-| `t`, `p_t` | Paired t-test, two-sided, `n − 1` degrees of freedom. `p = I_{ν/(ν+t²)}(ν/2, 1/2)` (regularized incomplete beta, Lentz continued fraction, Lanczos `ln Γ`). Constant non-zero differences give `t = ±∞, p = 0`, as in SciPy. | `scipy.stats.ttest_rel`, `scipy.stats.t.sf`: relative error ≤ 3.2e-12 on the distribution grid |
+| `cohens_d` | `mean(d) / sd(d)` with `n − 1` (d_z, Cohen's d for paired samples). Undefined (null) when the differences are constant (see `zero-variance`). | NumPy |
+| `t`, `p_t` | Paired t-test, two-sided, `n − 1` degrees of freedom. `p = I_{ν/(ν+t²)}(ν/2, 1/2)` (regularized incomplete beta, Lentz continued fraction, Lanczos `ln Γ`). Constant non-zero differences give `t = ±∞, p = 0`, as in SciPy; differences count as constant when their range is at most 1e-9 times their largest magnitude, so binary rounding noise does not produce a huge finite t. | `scipy.stats.ttest_rel`, `scipy.stats.t.sf`: relative error ≤ 3.2e-12 on the distribution grid |
 | `p_randomization` | Two-sided sign-flip test of `S = Σ d`. An assignment counts when `\|S*\| ≥ \|S\| − 1e-9·Σ\|d\|`; this tolerance absorbs binary rounding, so 0.1 − 0.2 + 0.2 − 0.1 ties with 0. Zero differences are dropped. With `m` non-zero differences and `2^m ≤ --trials`, all assignments are enumerated (exact). Otherwise `--trials` random assignments give `p = (1 + hits)/(1 + trials)`. | Exact rational enumeration (39 fixtures). `scipy.stats.permutation_test` exact (38 of 39 equal; the other is a binary-rounding tie SciPy misses) and Monte Carlo (within 5 standard errors). |
 | `ci_low`, `ci_high` | Paired percentile bootstrap: `--bootstrap` resamples of the queries with replacement. The interval is given by the `(1 ± confidence)/2` quantiles of the resampled means, interpolated linearly (type 7). | `scipy.stats.bootstrap(method="percentile")`, within Monte Carlo error; `numpy.quantile` exactly |
 | `p_adjusted` | The primary test's p-value (`--test randomization` (default) or `t`), corrected across all comparisons of the invocation (every metric and pair): `--correction holm` (default), `bh` or `none`. | `statsmodels` `multipletests` `holm` and `fdr_bh` |
 | `significant` | `p_adjusted ≤ --alpha` (default 0.05) | |
 
-Random numbers come from xoshiro256++ seeded by SplitMix64; both are implemented in `src/rng.rs` and tested against the reference C code. Each comparison draws from its own stream, seeded with `splitmix64(seed ^ fnv1a(metric, run a, run b, test))`. Results therefore do not depend on the order of comparisons, and a seed reproduces them in every version. Bounded integers use Lemire's unbiased method. Defaults: `--seed 0`, `--trials 10000`, `--bootstrap 10000`, `--confidence 0.95`.
+Random numbers come from xoshiro256++ seeded by SplitMix64; both are implemented in `src/rng.rs` and tested against the reference C code. Each comparison draws from its own stream, seeded with `splitmix64(seed ^ fnv1a(fnv1a(metric, paired qids and values), test))`. The stream depends only on the metric and the paired data, not on file names or on the other runs of the invocation, so renaming a run or adding a third one leaves a pair's p-value and interval unchanged, and a seed reproduces them in every version. Bounded integers use Lemire's unbiased method. Defaults: `--seed 0`, `--trials 10000`, `--bootstrap 10000`, `--confidence 0.95`.
 
 Without `-c`, a query that one run lacks is dropped from that pair's sample and reported (`comparison-queries-differ`). `-c` scores it 0 instead. A comparison with fewer than `--min-queries` (default 20) pairs is reported as `small-sample`.
 
@@ -114,7 +114,7 @@ Without `-c`, a query that one run lacks is dropped from that pair's sample and 
 - `json` embeds findings in the document.
 - `jsonl` writes only `rf.finding/1` records. Metric values become `info` findings with rule `measurement`, and comparisons rule `comparison`.
 
-Exit codes: 0 on success, 1 when a finding has severity `error` (only `check` produces these), and 2 for usage, input or I/O errors.
+Output to a closed pipe (for example `| head`) ends quietly. Exit codes: 0 on success, 1 when a finding has severity `error` (only `check` produces these), and 2 for usage, input or I/O errors.
 
 ### Findings
 
@@ -125,17 +125,18 @@ Exit codes: 0 on success, 1 when a finding has severity `error` (only `check` pr
 | `query-without-relevant` | info | Qrels queries with no document at the relevance level (still averaged) |
 | `unjudged-in-top-k` | warn | Queries whose unjudged fraction in the top `--unjudged-k` (10) exceeds `--unjudged-threshold` (0.1) |
 | `tie-at-cutoff` | warn or info | The documents at ranks k and k+1 have the same score, for a cutoff k in use. Severity is warn when the tied documents have different judgments, because then the docid tie-break decides the metric value. |
-| `run-duplicate-doc` | warn (`eval --duplicates first`), error (`check`) | A document listed more than once for a query |
+| `run-duplicate-doc` | warn (`eval --duplicates first`, or a query without judgments), error (`check`, judged queries) | A document listed more than once for a query |
 | `comparison-queries-differ` | warn | Queries left out of a paired comparison because one run lacks them |
 | `small-sample` | warn | A comparison uses fewer than `--min-queries` queries |
-| `zero-variance` | warn | All paired differences are equal, so t and d are undefined or infinite |
+| `zero-variance` | warn | All paired differences are equal (to within relative 1e-9), so t and d are undefined or infinite |
+| `query-named-all` | warn | The qrels contain a query with id `all`, which collides with the aggregate row of `trec_eval`-style output |
 | `measurement`, `comparison` | info | Values in `jsonl` output |
 
-Paths in findings are relative to the directory of `research.toml` when they lie inside it. `SOURCE_DATE_EPOCH` fixes the `at` timestamp.
+Paths in findings are relative to the directory of `research.toml` when they lie inside it. `SOURCE_DATE_EPOCH` (integer seconds) fixes the `at` timestamp; a malformed value is a usage error.
 
 ## Configuration
 
-`ireval` reads defaults from the `[ireval]` table of the nearest `research.toml`, searching upward from the current directory, or from `--config <path>`. Flags override the table, and unknown keys are reported on standard error and otherwise ignored.
+`ireval` reads defaults from the `[ireval]` table of the nearest `research.toml`, searching upward from the current directory, or from `--config <path>`. Flags override the table, and unknown keys are reported on standard error and otherwise ignored. Known keys are validated when the file is read: an unknown `missing`, `test` or `correction` value, or an empty `metrics` list, is an error.
 
 ```toml
 [ireval]
