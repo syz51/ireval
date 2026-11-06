@@ -90,6 +90,24 @@ pub struct Metric {
     pub cutoff: Option<usize>,
 }
 
+impl Metric {
+    /// Checks the cutoff against the metric kind: P, R, Success and Judged
+    /// need one, counts and R-precision take none, and a cutoff is positive.
+    /// [`parse_spec`] and [`expand`] only produce valid metrics.
+    pub fn validate(self) -> Result<(), String> {
+        match self.cutoff {
+            Some(0) => Err(format!("{self}: cutoff must be positive")),
+            Some(_) if !self.kind.allows_cutoff() => {
+                Err(format!("{self}: {} takes no cutoff", self.kind.base_name()))
+            }
+            None if self.kind.requires_cutoff() => {
+                Err(format!("{} needs a cutoff", self.kind.base_name()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 impl fmt::Display for Metric {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.cutoff {
@@ -268,7 +286,8 @@ fn ndcg(q: &QueryData<'_>, cutoff: Option<usize>, gain: impl Fn(i64) -> f64) -> 
     }
 }
 
-/// Value of `metric` for one query.
+/// Value of `metric` for one query. `metric` must be valid
+/// ([`Metric::validate`]); [`crate::eval::evaluate`] checks this.
 pub fn compute(metric: Metric, q: &QueryData<'_>) -> f64 {
     let k = metric.cutoff;
     match metric.kind {

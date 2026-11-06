@@ -77,6 +77,12 @@ fn is_skipped(line: &str) -> bool {
     t.is_empty() || t.starts_with('#')
 }
 
+/// Drops a leading UTF-8 byte order mark, which editors on Windows often
+/// write and which would otherwise become part of the first query id.
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 fn detect(text: &str, format: Format) -> Format {
     match format {
         Format::Auto => {
@@ -96,6 +102,7 @@ pub fn read_file(path: &Path) -> Result<String> {
 }
 
 pub fn parse_qrels(text: &str, path: &str, format: Format) -> Result<Qrels> {
+    let text = strip_bom(text);
     let mut queries: BTreeMap<String, QueryQrels> = BTreeMap::new();
     let format = detect(text, format);
     for (i, line) in text.lines().enumerate() {
@@ -148,6 +155,7 @@ pub fn parse_qrels(text: &str, path: &str, format: Format) -> Result<Qrels> {
 }
 
 pub fn parse_run(text: &str, path: &str, format: Format) -> Result<Run> {
+    let text = strip_bom(text);
     let mut queries: BTreeMap<String, Vec<RunEntry>> = BTreeMap::new();
     let mut tag = None;
     let format = detect(text, format);
@@ -246,6 +254,19 @@ mod tests {
         .unwrap();
         assert_eq!(r.tag.as_deref(), Some("t"));
         assert_eq!(r.queries["1"][0].score, 0.5);
+    }
+
+    #[test]
+    fn leading_byte_order_mark_is_ignored() {
+        let q = parse_qrels("\u{feff}q1 0 d1 1\n", "q", Format::Auto).unwrap();
+        assert!(q.queries.contains_key("q1"));
+        let r = parse_run(
+            "\u{feff}{\"qid\":\"q1\",\"docid\":\"d1\",\"score\":1}\n",
+            "r",
+            Format::Auto,
+        )
+        .unwrap();
+        assert!(r.queries.contains_key("q1"));
     }
 
     #[test]

@@ -8,8 +8,9 @@ use crate::findings::{Evidence, Finding, Severity};
 use crate::input::{Error, Qrels, Result, Run};
 use crate::metrics::{self, Judgment, Metric, QueryData};
 
-/// Which queries are averaged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which queries are averaged. In `research.toml`: `"skip"` or `"zero"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Missing {
     /// trec_eval default: only queries present in both the qrels and the run.
     Skip,
@@ -115,7 +116,9 @@ fn trec_order(entries: &mut [&crate::input::RunEntry]) {
 }
 
 /// Evaluates one run. `name` labels it in output; findings about the run are
-/// appended to `findings`.
+/// appended to `findings`. Fails on invalid metrics or settings, on a
+/// duplicate document under [`Duplicates::Error`], and when no qrels query
+/// appears in the run (as `trec_eval` 9.0.8 does, with or without `-c`).
 pub fn evaluate(
     qrels: &Qrels,
     run: &Run,
@@ -124,6 +127,14 @@ pub fn evaluate(
     settings: &Settings,
     findings: &mut Vec<Finding>,
 ) -> Result<RunResult> {
+    for m in metrics {
+        m.validate().map_err(Error)?;
+    }
+    if settings.max_docs == Some(0) || settings.unjudged_k == 0 {
+        return Err(Error(
+            "max_docs and unjudged_k must be positive".to_string(),
+        ));
+    }
     let stats = qrels_stats(qrels, settings.relevance_level);
     let level = settings.relevance_level;
     let mut queries = Vec::new();
@@ -305,6 +316,33 @@ pub fn evaluate(
         .filter(|q| !qrels.queries.contains_key(*q))
         .map(String::as_str)
         .collect();
+    // trec_eval only checks the queries it evaluates, so duplicates in
+    // unjudged queries never refuse a run; they are still reported.
+    let mut unjudged_duplicates = 0usize;
+    let mut unjudged_example = None;
+    for qid in &extra {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for e in &run.queries[*qid] {
+            if let Some(&first) = seen.get(e.docid.as_str()) {
+                unjudged_duplicates += 1;
+                unjudged_example.get_or_insert((e.line, e.docid.clone(), qid.to_string(), first));
+            } else {
+                seen.insert(&e.docid, e.line);
+            }
+        }
+    }
+    if let Some((line, docid, qid, first)) = unjudged_example {
+        findings.push(Finding::new(
+            "run-duplicate-doc",
+            Severity::Warn,
+            format!("{}:{line}", run.path),
+            format!(
+                "{unjudged_duplicates} duplicate document entries in queries without judgments (not evaluated); first: {docid:?} in query {qid:?}, also line {first}"
+            ),
+            evidence(format!("line {line}")),
+            Some(json!({"run": name, "duplicates": unjudged_duplicates, "evaluated": false})),
+        ));
+    }
     if !extra.is_empty() {
         findings.push(Finding::new(
             "query-not-in-qrels",
@@ -369,7 +407,7 @@ pub fn evaluate(
         ));
     }
 
-    if queries.is_empty() {
+    if queries.iter().all(|q| q.missing) {
         return Err(Error(format!(
             "{}: no query has both results and judgments in {}",
             run.path, qrels.path
@@ -405,4 +443,105 @@ pub fn queries_without_relevant(qrels: &Qrels, level: i64) -> Vec<&str> {
 
 pub fn first_n(items: &[&str]) -> Vec<String> {
     items.iter().take(20).map(|s| s.to_string()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::{Format, parse_qrels, parse_run};
+    use crate::metrics::Kind;
+
+    fn settings(missing: Missing) -> Settings {
+        Settings {
+            relevance_level: 1,
+            missing,
+            max_docs: None,
+            duplicates: Duplicates::Error,
+            unjudged_k: 10,
+            unjudged_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_metrics_and_disjoint_runs() {
+        let qrels = parse_qrels("q1 0 d1 1\n", "q", Format::Trec).unwrap();
+        let run = parse_run("q1 Q0 d1 1 1 t\n", "r", Format::Trec).unwrap();
+        for m in [
+            Metric {
+                kind: Kind::P,
+                cutoff: Some(0),
+            },
+            Metric {
+                kind: Kind::P,
+                cutoff: None,
+            },
+            Metric {
+                kind: Kind::NumRel,
+                cutoff: Some(5),
+            },
+        ] {
+            let e = evaluate(
+                &qrels,
+                &run,
+                "r",
+                &[m],
+                &settings(Missing::Skip),
+                &mut Vec::new(),
+            );
+            assert!(e.is_err(), "{m:?}");
+        }
+        let mut s = settings(Missing::Skip);
+        s.max_docs = Some(0);
+        let ap = Metric {
+            kind: Kind::AP,
+            cutoff: None,
+        };
+        assert!(evaluate(&qrels, &run, "r", &[ap], &s, &mut Vec::new()).is_err());
+        let other = parse_run("zz Q0 d1 1 1 t\n", "o", Format::Trec).unwrap();
+        for missing in [Missing::Skip, Missing::Zero] {
+            let e = evaluate(
+                &qrels,
+                &other,
+                "o",
+                &[ap],
+                &settings(missing),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(
+                e.0.contains("no query has both results and judgments"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicates_in_unjudged_queries_are_reported_not_refused() {
+        let qrels = parse_qrels("q1 0 d1 1\n", "q", Format::Trec).unwrap();
+        let run = parse_run(
+            "q1 Q0 d1 1 1 t\nq9 Q0 d5 1 1 t\nq9 Q0 d5 2 0.5 t\n",
+            "r",
+            Format::Trec,
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        let ap = Metric {
+            kind: Kind::AP,
+            cutoff: None,
+        };
+        evaluate(
+            &qrels,
+            &run,
+            "r",
+            &[ap],
+            &settings(Missing::Skip),
+            &mut findings,
+        )
+        .unwrap();
+        let f = findings
+            .iter()
+            .find(|f| f.rule == "run-duplicate-doc")
+            .unwrap();
+        assert_eq!(f.subject, "r:3");
+    }
 }
