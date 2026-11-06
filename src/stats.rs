@@ -187,7 +187,16 @@ pub const PERM_TIE_TOLERANCE: f64 = 1e-9;
 /// dropped. When `2^m <= trials` for the `m` non-zero differences every
 /// assignment is enumerated and the p-value is exact; otherwise `trials`
 /// assignments are drawn and `p = (1 + hits) / (1 + trials)`, which is never 0.
+/// With no pairs at all the p-value is NaN, so the comparison stays out of a
+/// multiple-comparison family (as the t-test's NaN does).
 pub fn paired_randomization(d: &[f64], trials: u64, rng: &mut Xoshiro256pp) -> PermTest {
+    if d.is_empty() {
+        return PermTest {
+            p: f64::NAN,
+            method: PermMethod::Exact,
+            samples: 0,
+        };
+    }
     let nz: Vec<f64> = d.iter().copied().filter(|x| *x != 0.0).collect();
     let m = nz.len();
     let observed: f64 = nz.iter().sum::<f64>().abs();
@@ -284,13 +293,16 @@ pub fn bootstrap_mean_ci(
     )
 }
 
-/// Multiple-comparison correction applied to a family of p-values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Multiple-comparison correction applied to a family of p-values. In
+/// `research.toml`: `"none"`, `"holm"` or `"bh"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Correction {
     None,
     /// Holm–Bonferroni step-down (controls the family-wise error rate).
     Holm,
     /// Benjamini–Hochberg step-up (controls the false discovery rate).
+    #[serde(rename = "bh")]
     BenjaminiHochberg,
 }
 
@@ -358,6 +370,9 @@ mod tests {
         assert!((r.p - 0.25).abs() < 1e-15);
         let r = paired_randomization(&[0.0, 0.0], 10_000, &mut rng);
         assert_eq!(r.p, 1.0);
+        let r = paired_randomization(&[], 10_000, &mut rng);
+        assert!(r.p.is_nan());
+        assert_eq!(r.samples, 0);
     }
 
     #[test]

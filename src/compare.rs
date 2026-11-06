@@ -1,17 +1,20 @@
 //! Paired comparisons of runs over queries.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use serde_json::json;
 
 use crate::eval::{RunResult, first_n};
 use crate::findings::{Evidence, Finding, Severity};
 use crate::metrics::Metric;
-use crate::rng::{Xoshiro256pp, stream_seed};
-use crate::stats::{self, Correction, PermMethod};
+use crate::rng::{Xoshiro256pp, fnv1a, stream_seed};
+use crate::stats::{self, Correction, PermMethod, TTest};
 
-/// Which test's p-value is corrected and used for significance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which test's p-value is corrected and used for significance. In
+/// `research.toml`: `"t"` or `"randomization"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Primary {
     T,
     Randomization,
@@ -34,8 +37,12 @@ pub struct CompareSettings {
 #[derive(Clone, Debug)]
 pub struct Comparison {
     pub metric: Metric,
+    /// Display names of the two runs.
     pub a: String,
     pub b: String,
+    /// Paths of the two runs, as given.
+    pub a_path: String,
+    pub b_path: String,
     pub n: usize,
     pub mean_a: f64,
     pub mean_b: f64,
@@ -54,6 +61,37 @@ pub struct Comparison {
     /// Primary p-value after correction across the whole family.
     pub p_adjusted: f64,
     pub significant: bool,
+}
+
+/// True when the differences agree to within [`stats::PERM_TIE_TOLERANCE`]
+/// relative to their largest magnitude. Binary rounding makes, for example,
+/// P@10 differences of one document come out as 0.1, 0.09999999999999998 and
+/// 0.10000000000000003; treating those as varying would give an enormous t
+/// and Cohen's d.
+fn effectively_constant(d: &[f64]) -> bool {
+    let (lo, hi) = d
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+            (lo.min(x), hi.max(x))
+        });
+    let scale = d.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    hi - lo <= stats::PERM_TIE_TOLERANCE * scale
+}
+
+/// Identifies a pair's paired data for seeding: the metric, the query ids and
+/// the exact values of both runs. Streams therefore depend only on the seed
+/// and the data, not on file names or on which other runs are compared.
+fn data_key(metric: &str, qids: &[&str], a: &[f64], b: &[f64]) -> String {
+    let mut key = String::from(metric);
+    for ((q, x), y) in qids.iter().zip(a).zip(b) {
+        let _ = write!(
+            key,
+            "\u{1e}{q}\u{1f}{:016x}\u{1f}{:016x}",
+            x.to_bits(),
+            y.to_bits()
+        );
+    }
+    format!("{:016x}", fnv1a(&[&key]))
 }
 
 pub fn compare(
@@ -109,26 +147,44 @@ pub fn compare(
             let d: Vec<f64> = a.iter().zip(&b).map(|(x, y)| y - x).collect();
             let name = metric.to_string();
             let n = d.len();
-            let tt = stats::paired_t(&d);
-            let mut perm_rng =
-                Xoshiro256pp::from_seed(stream_seed(s.seed, &[&name, &ra.name, &rb.name, "perm"]));
+            let diff = if n > 0 { stats::mean(&d) } else { f64::NAN };
+            let constant = n > 1 && effectively_constant(&d);
+            // Constant differences: t is ±inf with p = 0 (NaN when the
+            // difference is 0), as scipy.stats.ttest_rel reports for exactly
+            // constant input, and Cohen's d is undefined.
+            let tt = if constant {
+                let degenerate = diff == 0.0;
+                TTest {
+                    t: if degenerate {
+                        f64::NAN
+                    } else {
+                        diff.signum() * f64::INFINITY
+                    },
+                    df: (n - 1) as f64,
+                    p: if degenerate { f64::NAN } else { 0.0 },
+                }
+            } else {
+                stats::paired_t(&d)
+            };
+            let key = data_key(&name, &common, &a, &b);
+            let mut perm_rng = Xoshiro256pp::from_seed(stream_seed(s.seed, &[&key, "perm"]));
             let perm = stats::paired_randomization(&d, s.trials, &mut perm_rng);
-            let mut boot_rng = Xoshiro256pp::from_seed(stream_seed(
-                s.seed,
-                &[&name, &ra.name, &rb.name, "bootstrap"],
-            ));
+            let mut boot_rng = Xoshiro256pp::from_seed(stream_seed(s.seed, &[&key, "bootstrap"]));
             let (ci_low, ci_high) =
                 stats::bootstrap_mean_ci(&d, s.bootstrap, s.confidence, &mut boot_rng);
-            let sd = stats::sample_sd(&d);
-            let diff = if n > 0 { stats::mean(&d) } else { f64::NAN };
-            let cohens_d = if sd > 0.0 { diff / sd } else { f64::NAN };
-            if n > 1 && sd == 0.0 {
+            let cohens_d = if constant || n < 2 {
+                f64::NAN
+            } else {
+                diff / stats::sample_sd(&d)
+            };
+            if constant {
                 findings.push(Finding::new(
                     "zero-variance",
                     Severity::Warn,
                     format!("{} vs {}", ra.path, rb.path),
                     format!(
-                        "{name}: every paired difference is {diff}; the t statistic and Cohen's d are undefined or infinite"
+                        "{name}: every paired difference is {diff} (to within relative {}); the t statistic is infinite or undefined and Cohen's d is undefined",
+                        stats::PERM_TIE_TOLERANCE
                     ),
                     vec![],
                     Some(json!({"metric": name, "a": ra.name, "b": rb.name, "n": n})),
@@ -138,6 +194,8 @@ pub fn compare(
                 metric,
                 a: ra.name.clone(),
                 b: rb.name.clone(),
+                a_path: ra.path.clone(),
+                b_path: rb.path.clone(),
                 n,
                 mean_a: if n > 0 { stats::mean(&a) } else { f64::NAN },
                 mean_b: if n > 0 { stats::mean(&b) } else { f64::NAN },
@@ -192,4 +250,111 @@ pub fn compare(
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::QueryResult;
+    use crate::metrics::Kind;
+
+    fn run(name: &str, path: &str, values: &[(&str, f64)]) -> RunResult {
+        RunResult {
+            name: name.into(),
+            path: path.into(),
+            tag: None,
+            queries: values
+                .iter()
+                .map(|&(q, v)| QueryResult {
+                    qid: q.into(),
+                    missing: false,
+                    values: vec![v],
+                })
+                .collect(),
+            aggregate: vec![0.0],
+        }
+    }
+
+    fn settings(trials: u64) -> CompareSettings {
+        CompareSettings {
+            primary: Primary::Randomization,
+            correction: Correction::Holm,
+            seed: 3,
+            trials,
+            bootstrap: 200,
+            confidence: 0.95,
+            alpha: 0.05,
+            min_queries: 1,
+            all_pairs: false,
+        }
+    }
+
+    const P10: Metric = Metric {
+        kind: Kind::P,
+        cutoff: Some(10),
+    };
+
+    #[test]
+    fn rounding_noise_counts_as_constant_differences() {
+        // One more relevant document in the top 10 for every query.
+        let a = run("a", "a", &[("q1", 0.1), ("q2", 0.2), ("q3", 0.7)]);
+        let b = run("b", "b", &[("q1", 0.2), ("q2", 0.3), ("q3", 0.8)]);
+        let mut findings = Vec::new();
+        let c = &compare(&[a, b], &[P10], &settings(1000), &mut findings)[0];
+        assert!(c.cohens_d.is_nan());
+        assert_eq!(c.t, f64::INFINITY);
+        assert_eq!(c.p_t, 0.0);
+        assert!(findings.iter().any(|f| f.rule == "zero-variance"));
+    }
+
+    #[test]
+    fn a_pair_without_common_queries_stays_out_of_the_family() {
+        let a = run("a", "a", &[("q1", 0.1), ("q2", 0.2), ("q3", 0.3)]);
+        let b = run("b", "b", &[("q1", 0.5), ("q2", 0.6), ("q3", 0.9)]);
+        let c = run("c", "c", &[("q9", 0.5)]);
+        let mut findings = Vec::new();
+        let two = compare(
+            &[a.clone(), b.clone()],
+            &[P10],
+            &settings(1000),
+            &mut findings,
+        );
+        let three = compare(&[a, b, c], &[P10], &settings(1000), &mut findings);
+        assert_eq!(three[1].n, 0);
+        assert!(three[1].p_perm.is_nan() && three[1].p_adjusted.is_nan());
+        assert_eq!(two[0].p_adjusted, three[0].p_adjusted);
+    }
+
+    #[test]
+    fn streams_depend_on_data_not_on_names() {
+        let vals_a: Vec<(String, f64)> = (0..40)
+            .map(|i| (format!("q{i}"), (i % 7) as f64 / 10.0))
+            .collect();
+        let vals_b: Vec<(String, f64)> = (0..40)
+            .map(|i| (format!("q{i}"), (i % 5) as f64 / 10.0))
+            .collect();
+        let va: Vec<(&str, f64)> = vals_a.iter().map(|(q, v)| (q.as_str(), *v)).collect();
+        let vb: Vec<(&str, f64)> = vals_b.iter().map(|(q, v)| (q.as_str(), *v)).collect();
+        let mut findings = Vec::new();
+        let x = &compare(
+            &[run("a", "x/a.run", &va), run("b", "y/b.run", &vb)],
+            &[P10],
+            &settings(500),
+            &mut findings,
+        )[0];
+        let y = &compare(
+            &[
+                run("x/a.run", "./x/a.run", &va),
+                run("other", "z/b.run", &vb),
+            ],
+            &[P10],
+            &settings(500),
+            &mut findings,
+        )[0];
+        assert_eq!(x.perm_method, PermMethod::MonteCarlo);
+        assert_eq!(
+            (x.p_perm, x.ci_low, x.ci_high),
+            (y.p_perm, y.ci_low, y.ci_high)
+        );
+    }
 }
