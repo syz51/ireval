@@ -1,0 +1,20 @@
+[package]
+name = "ireval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+description = "Information-retrieval evaluation with trec_eval semantics and paired significance tests"
+keywords = ["information-retrieval", "trec", "evaluation", "ndcg"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+toml = "1.2.1"
+
+# The statistics parity tests draw 2 x 10^5 bootstrap resamples; unoptimized
+# they take close to a minute.
+[profile.test]
+opt-level = 2
