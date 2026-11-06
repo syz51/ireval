@@ -6,3 +6,5 @@ pub mod eval;
 pub mod findings;
 pub mod input;
 pub mod metrics;
+pub mod rng;
+pub mod stats;
