@@ -200,6 +200,10 @@ The largest difference, 1.1e-16, is one unit in the last place. The references d
 
 The random-number generator and the statistical functions are implemented in this crate. Each is a few dozen lines, and owning them pins seeded results to a documented algorithm independent of other crates' release choices.
 
+## Versioning
+
+Every pull request that changes the tool's behaviour raises the version in `Cargo.toml` and `Cargo.lock`.
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
