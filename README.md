@@ -125,7 +125,7 @@ Output to a closed pipe (for example `| head`) ends quietly. Exit codes: 0 on su
 | `query-without-relevant` | info | Qrels queries with no document at the relevance level (still averaged) |
 | `unjudged-in-top-k` | warn | Queries whose unjudged fraction in the top `--unjudged-k` (10) exceeds `--unjudged-threshold` (0.1) |
 | `tie-at-cutoff` | warn or info | The documents at ranks k and k+1 have the same score, for a cutoff k in use. Severity is warn when the tied documents have different judgments, because then the docid tie-break decides the metric value. |
-| `tie-reorders-run` | warn or info | Documents with the same score are written in an order, by integer rank or else by line, that the docid tie-break changes. Groups below `-M` are not counted. Severity is warn when a reordered group has different judgments, because then the tie-break, not the written order, decides the metric value. The finding counts the queries and groups and names the first group. |
+| `tie-reorders-run` | warn or info | Documents with the same score are written in an order, by integer rank or else by line, that the docid tie-break changes. Only the documents within `-M` are compared. Severity is warn when a reordered group has different judgments, because then the tie-break, not the written order, decides the metric value. The finding counts the queries and groups and names the first group. |
 | `run-duplicate-doc` | warn (`eval --duplicates first`, or a query without judgments), error (`check`, judged queries) | A document listed more than once for a query |
 | `comparison-queries-differ` | warn | Queries left out of a paired comparison because one run lacks them |
 | `small-sample` | warn | A comparison uses fewer than `--min-queries` queries |

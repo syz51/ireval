@@ -248,6 +248,10 @@ pub fn evaluate(
                     .iter()
                     .take_while(|e| e.score == score)
                     .count();
+            if end - start < 2 {
+                start = end;
+                continue;
+            }
             let group = &kept[start..end];
             let mut written = group.to_vec();
             if written.iter().all(|e| e.rank.is_some()) {
@@ -255,7 +259,15 @@ pub fn evaluate(
             } else {
                 written.sort_by_key(|e| e.line);
             }
-            if written.iter().zip(group).any(|(w, g)| w.docid != g.docid) {
+            // Only the part within -M is evaluated. A group crossing -M is
+            // reordered when that part differs; its documents below -M count
+            // for the judgments, since the written order would bring them in.
+            let shown = depth.min(end) - start;
+            if written[..shown]
+                .iter()
+                .zip(&group[..shown])
+                .any(|(w, g)| w.docid != g.docid)
+            {
                 reorder.groups += 1;
                 query_reordered = true;
                 let first = ranked_all[start].judgment;
@@ -705,5 +717,12 @@ mod tests {
         let run = "q1 Q0 d1 1 3 t\nq1 Q0 d2 2 1 t\nq1 Q0 d3 3 1 t\n";
         assert!(reorder_finding(run, Format::Trec, Some(1)).is_none());
         assert!(reorder_finding(run, Format::Trec, Some(2)).is_some());
+        // A group crossing -M 1: d3 is first in both orders, so the evaluated
+        // part keeps the written order.
+        let run = "q1 Q0 d3 1 1 t\nq1 Q0 d1 2 1 t\nq1 Q0 d2 3 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, Some(1)).is_none());
+        // Within -M 2 the written d3, d1 becomes d3, d2.
+        let f = reorder_finding(run, Format::Trec, Some(2)).unwrap();
+        assert_eq!(f.severity, Severity::Warn);
     }
 }
