@@ -42,6 +42,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Evaluate runs and print aggregate (and optionally per-query) metrics.
+    #[command(visible_alias = "score")]
     Eval {
         #[command(flatten)]
         common: Common,
