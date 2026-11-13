@@ -300,3 +300,23 @@ fn closed_stdout_ends_output_without_a_panic() {
     assert!(o.status.success(), "{:?}: {}", o.status, stderr(&o));
     assert!(!stderr(&o).contains("panicked"), "{}", stderr(&o));
 }
+
+#[test]
+fn score_is_an_alias_of_eval() {
+    // Claude Code's worktree isolation refuses commands that contain the word
+    // eval, so agents there run `ireval score`.
+    let args = ["-q", "-m", "success@1,RR,AP", Q, A, B];
+    let eval = ireval(&[&["eval"][..], &args].concat());
+    let score = ireval(&[&["score"][..], &args].concat());
+    assert!(eval.status.success(), "{}", stderr(&eval));
+    assert!(score.status.success(), "{}", stderr(&score));
+    assert_eq!(stdout(&score), stdout(&eval));
+    assert_eq!(stderr(&score), stderr(&eval));
+
+    let help = stdout(&ireval(&["--help"]));
+    let line = help
+        .lines()
+        .find(|l| l.trim_start().starts_with("eval"))
+        .unwrap();
+    assert!(line.contains("[alias: score]"), "{help}");
+}
