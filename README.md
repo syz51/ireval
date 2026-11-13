@@ -4,7 +4,7 @@ Information-retrieval evaluation with `trec_eval` semantics, and paired signific
 
 - Every metric reproduces a named `trec_eval` or `ir_measures` measure. Randomized parity tests against `trec_eval` 9.0.8 and 10.0-rc3, `pytrec_eval`, `ir_measures` and `ranx` agree to within 1.2e-16 ([Parity](#parity)).
 - Paired t-test, randomization (sign-flip) test, bootstrap confidence interval, Cohen's d, and Holm or Benjamini–Hochberg correction. These are checked against SciPy, NumPy and statsmodels.
-- Data problems that silently change conclusions are reported as `rf.finding/1` records: unjudged documents, queries missing from a run, duplicate documents, and ties at a cutoff.
+- Data problems that silently change conclusions are reported as `rf.finding/1` records: unjudged documents, queries missing from a run, duplicate documents, ties at a cutoff, and tied scores whose written order the ranking changes.
 
 ```sh
 cargo install --path .
@@ -24,13 +24,13 @@ ireval check --format jsonl qrels.txt *.run               # findings only; exit 
 - The format is detected from the first record (`{` means JSON Lines). `--qrels-format` and `--run-format` override the detection.
 - TREC fields are separated by whitespace. Blank lines and lines starting with `#` are skipped, and a leading UTF-8 byte order mark is ignored.
 - In JSON, `qid` and `docid` may be strings or integers, and unknown fields are ignored.
-- The `iter`, `Q0` and `rank` columns are ignored, as in `trec_eval`: ranks always come from the scores.
+- The `iter`, `Q0` and `rank` columns are ignored, as in `trec_eval`: ranks always come from the scores. An integer rank, and an integer `rank` field in JSON, is read only to report tied scores that the ranking reorders (`tie-reorders-run`).
 - `rel` must be an integer. A score that is not a number, or is NaN, is an error.
 - A repeated `(qid, docid)` in the qrels is an error. Errors name the file and line.
 
 ## Evaluation semantics
 
-**Ranking.** Each query's documents are sorted by score descending, with ties broken by docid descending in byte order. This is `trec_eval`'s `comp_sim_docno` in `form_res_rels.c`; the parity fixtures contain 228 ranked lists with tied scores. `-M/--max-docs N` then keeps the top N documents (`trec_eval -M`).
+**Ranking.** Each query's documents are sorted by score descending, with ties broken by docid descending in byte order. This is `trec_eval`'s `comp_sim_docno` in `form_res_rels.c`; the parity fixtures contain 228 ranked lists with tied scores. The written rank order of tied documents is not kept: a run that needs its order must give strictly decreasing scores, such as `score = N + 1 - rank`. When the tie-break changes the written order, the `tie-reorders-run` finding reports it. `-M/--max-docs N` then keeps the top N documents (`trec_eval -M`).
 
 **Judgments.** A retrieved document is judged when the qrels hold a label of 0 or more for it. A document missing from the qrels, or carrying a negative label, is unjudged. Negative labels are `trec_eval`'s "in pool but unjudged". An unjudged document is never relevant.
 
@@ -125,6 +125,7 @@ Output to a closed pipe (for example `| head`) ends quietly. Exit codes: 0 on su
 | `query-without-relevant` | info | Qrels queries with no document at the relevance level (still averaged) |
 | `unjudged-in-top-k` | warn | Queries whose unjudged fraction in the top `--unjudged-k` (10) exceeds `--unjudged-threshold` (0.1) |
 | `tie-at-cutoff` | warn or info | The documents at ranks k and k+1 have the same score, for a cutoff k in use. Severity is warn when the tied documents have different judgments, because then the docid tie-break decides the metric value. |
+| `tie-reorders-run` | warn or info | Documents with the same score are written in an order, by integer rank or else by line, that the docid tie-break changes. Groups below `-M` are not counted. Severity is warn when a reordered group has different judgments, because then the tie-break, not the written order, decides the metric value. The finding counts the queries and groups and names the first group. |
 | `run-duplicate-doc` | warn (`eval --duplicates first`, or a query without judgments), error (`check`, judged queries) | A document listed more than once for a query |
 | `comparison-queries-differ` | warn | Queries left out of a paired comparison because one run lacks them |
 | `small-sample` | warn | A comparison uses fewer than `--min-queries` queries |
