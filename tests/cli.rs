@@ -94,6 +94,12 @@ fn ties_break_by_docid_descending() {
     assert!(out.contains("run_a.txt,q1,P@2,0.5\n"), "{out}");
     assert!(out.contains("run_a.txt,q1,RR,0.5\n"), "{out}");
     assert!(stderr(&o).contains("warn[tie-at-cutoff]"), "{}", stderr(&o));
+    // The rank column lists d1 before d3, so the tie-break changes the written order.
+    assert!(
+        stderr(&o).contains("warn[tie-reorders-run]"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 #[test]

@@ -115,6 +115,24 @@ fn trec_order(entries: &mut [&crate::input::RunEntry]) {
     });
 }
 
+/// Tie groups in a run whose written order differs from [`trec_order`].
+#[derive(Default)]
+struct Reorder<'a> {
+    groups: usize,
+    qids: Vec<&'a str>,
+    /// Queries where a reordered group holds different judgments.
+    mixed: Vec<&'a str>,
+    example: Option<ReorderExample>,
+}
+
+struct ReorderExample {
+    line: usize,
+    qid: String,
+    score: f64,
+    written: Vec<String>,
+    evaluated: Vec<String>,
+}
+
 /// Evaluates one run. `name` labels it in output; findings about the run are
 /// appended to `findings`. Fails on invalid metrics or settings, on a
 /// duplicate document under [`Duplicates::Error`], and when no qrels query
@@ -156,6 +174,7 @@ pub fn evaluate(
     tie_cutoffs.dedup();
     // cutoff → (queries with a boundary tie, queries where the tie mixes judgments)
     let mut ties: BTreeMap<usize, (Vec<&str>, Vec<&str>)> = BTreeMap::new();
+    let mut reorder = Reorder::default();
 
     for (qid, qrel) in &qrels.queries {
         let st = &stats[qid.as_str()];
@@ -215,6 +234,60 @@ pub fn evaluate(
             .max_docs
             .map_or(ranked_all.len(), |d| d.min(ranked_all.len()));
         let judgments: Vec<Judgment> = ranked_all[..depth].iter().map(|r| r.judgment).collect();
+
+        // Tied scores whose written order the docid tie-break changes. The
+        // written order is the rank column when every tied entry has an
+        // integer rank, else the line order.
+        let mut query_reordered = false;
+        let mut query_mixed = false;
+        let mut start = 0;
+        while start < depth {
+            let score = kept[start].score;
+            let end = start
+                + kept[start..]
+                    .iter()
+                    .take_while(|e| e.score == score)
+                    .count();
+            if end - start < 2 {
+                start = end;
+                continue;
+            }
+            let group = &kept[start..end];
+            let mut written = group.to_vec();
+            if written.iter().all(|e| e.rank.is_some()) {
+                written.sort_by_key(|e| (e.rank, e.line));
+            } else {
+                written.sort_by_key(|e| e.line);
+            }
+            // Only the part within -M is evaluated. A group crossing -M is
+            // reordered when that part differs; its documents below -M count
+            // for the judgments, since the written order would bring them in.
+            let shown = depth.min(end) - start;
+            if written[..shown]
+                .iter()
+                .zip(&group[..shown])
+                .any(|(w, g)| w.docid != g.docid)
+            {
+                reorder.groups += 1;
+                query_reordered = true;
+                let first = ranked_all[start].judgment;
+                query_mixed |= ranked_all[start..end].iter().any(|r| r.judgment != first);
+                reorder.example.get_or_insert_with(|| ReorderExample {
+                    line: written[0].line,
+                    qid: qid.clone(),
+                    score,
+                    written: written.iter().take(5).map(|e| e.docid.clone()).collect(),
+                    evaluated: group.iter().take(5).map(|e| e.docid.clone()).collect(),
+                });
+            }
+            start = end;
+        }
+        if query_reordered {
+            reorder.qids.push(qid);
+            if query_mixed {
+                reorder.mixed.push(qid);
+            }
+        }
 
         // Boundary ties: the document at rank k ties with the one at k + 1.
         for &k in &tie_cutoffs {
@@ -407,6 +480,38 @@ pub fn evaluate(
         ));
     }
 
+    if let Some(ex) = &reorder.example {
+        let severity = if reorder.mixed.is_empty() {
+            Severity::Info
+        } else {
+            Severity::Warn
+        };
+        findings.push(Finding::new(
+            "tie-reorders-run",
+            severity,
+            format!("{}:{}", run.path, ex.line),
+            format!(
+                "{} queries have tied scores whose written order the docid tie-break changes ({} tie groups); in {} of them the tied documents have different judgments, so the tie-break, not the written order, decides the values; first: query {:?}, score {}, written {:?}, evaluated {:?}",
+                reorder.qids.len(),
+                reorder.groups,
+                reorder.mixed.len(),
+                ex.qid,
+                ex.score,
+                ex.written,
+                ex.evaluated
+            ),
+            evidence(format!("line {}", ex.line)),
+            Some(json!({
+                "run": name,
+                "queries_reordered": reorder.qids.len(),
+                "groups_reordered": reorder.groups,
+                "queries_reorder_changes_judgments": reorder.mixed.len(),
+                "qids": first_n(&reorder.qids),
+                "qids_judgments_differ": first_n(&reorder.mixed),
+            })),
+        ));
+    }
+
     if queries.iter().all(|q| q.missing) {
         return Err(Error(format!(
             "{}: no query has both results and judgments in {}",
@@ -543,5 +648,81 @@ mod tests {
             .find(|f| f.rule == "run-duplicate-doc")
             .unwrap();
         assert_eq!(f.subject, "r:3");
+    }
+
+    fn reorder_finding(run: &str, format: Format, max_docs: Option<usize>) -> Option<Finding> {
+        let qrels = parse_qrels(
+            "q1 0 d1 1\nq1 0 d2 0\nq1 0 d3 0\nq2 0 d1 1\n",
+            "q",
+            Format::Trec,
+        )
+        .unwrap();
+        let run = parse_run(run, "r", format).unwrap();
+        let mut s = settings(Missing::Skip);
+        s.max_docs = max_docs;
+        let mut findings = Vec::new();
+        let ap = Metric {
+            kind: Kind::AP,
+            cutoff: None,
+        };
+        evaluate(&qrels, &run, "r", &[ap], &s, &mut findings).unwrap();
+        findings.into_iter().find(|f| f.rule == "tie-reorders-run")
+    }
+
+    #[test]
+    fn tied_scores_that_change_the_written_order_are_reported() {
+        // Every score ties; the ranks put d1 first, trec_eval puts d3 first.
+        let run = "q1 Q0 d1 1 1 t\nq1 Q0 d2 2 1 t\nq1 Q0 d3 3 1 t\nq2 Q0 d1 1 1 t\n";
+        let f = reorder_finding(run, Format::Trec, None).unwrap();
+        assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.subject, "r:1");
+        let data = f.data.unwrap();
+        assert_eq!(data["queries_reordered"], 1);
+        assert_eq!(data["groups_reordered"], 1);
+        assert_eq!(data["qids"], json!(["q1"]));
+        assert_eq!(data["qids_judgments_differ"], json!(["q1"]));
+        assert!(
+            f.message
+                .contains(r#"written ["d1", "d2", "d3"], evaluated ["d3", "d2", "d1"]"#)
+        );
+
+        // Equal judgments in the reordered group: the values do not change.
+        let run = "q1 Q0 d2 1 1 t\nq1 Q0 d3 2 1 t\n";
+        let f = reorder_finding(run, Format::Trec, None).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+    }
+
+    #[test]
+    fn written_order_follows_the_rank_column_then_the_lines() {
+        // Ranks list d3 before d1, which is the trec_eval order: no finding.
+        let run = "q1 Q0 d1 2 1 t\nq1 Q0 d3 1 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, None).is_none());
+        // A rank that is not an integer falls back to the line order.
+        let run = "q1 Q0 d1 x 1 t\nq1 Q0 d3 1 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, None).is_some());
+        let run = "q1 Q0 d3 x 1 t\nq1 Q0 d1 1 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, None).is_none());
+        // JSON Lines: the optional rank, else the line order.
+        let run = "{\"qid\":\"q1\",\"docid\":\"d1\",\"score\":1,\"rank\":2}\n{\"qid\":\"q1\",\"docid\":\"d3\",\"score\":1,\"rank\":1}\n";
+        assert!(reorder_finding(run, Format::Jsonl, None).is_none());
+        let run = "{\"qid\":\"q1\",\"docid\":\"d1\",\"score\":1}\n{\"qid\":\"q1\",\"docid\":\"d3\",\"score\":1}\n";
+        assert!(reorder_finding(run, Format::Jsonl, None).is_some());
+    }
+
+    #[test]
+    fn distinct_scores_and_ties_below_the_depth_are_not_reported() {
+        let run = "q1 Q0 d1 1 3 t\nq1 Q0 d2 2 2 t\nq1 Q0 d3 3 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, None).is_none());
+        // d2 and d3 tie below -M 1.
+        let run = "q1 Q0 d1 1 3 t\nq1 Q0 d2 2 1 t\nq1 Q0 d3 3 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, Some(1)).is_none());
+        assert!(reorder_finding(run, Format::Trec, Some(2)).is_some());
+        // A group crossing -M 1: d3 is first in both orders, so the evaluated
+        // part keeps the written order.
+        let run = "q1 Q0 d3 1 1 t\nq1 Q0 d1 2 1 t\nq1 Q0 d2 3 1 t\n";
+        assert!(reorder_finding(run, Format::Trec, Some(1)).is_none());
+        // Within -M 2 the written d3, d1 becomes d3, d2.
+        let f = reorder_finding(run, Format::Trec, Some(2)).unwrap();
+        assert_eq!(f.severity, Severity::Warn);
     }
 }

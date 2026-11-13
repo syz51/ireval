@@ -3,9 +3,11 @@
 //! TREC qrels lines are `qid iter docid rel` and TREC run lines are
 //! `qid Q0 docid rank score tag`, separated by whitespace. As in trec_eval the
 //! `iter`, `Q0` and `rank` columns are ignored: ranks are recomputed from the
-//! scores. Blank lines and lines starting with `#` are skipped. JSON Lines
-//! records are `{"qid","docid","rel"}` and `{"qid","docid","score"}` (plus an
-//! optional `"tag"`); `qid` and `docid` may be strings or integers and unknown
+//! scores. An integer rank is kept only to report tied scores whose written
+//! order the recomputed ranking changes. Blank lines and lines starting with
+//! `#` are skipped. JSON Lines records are `{"qid","docid","rel"}` and
+//! `{"qid","docid","score"}` (plus an optional `"tag"` and integer `"rank"`);
+//! `qid` and `docid` may be strings or integers and unknown
 //! fields are ignored.
 
 use std::collections::{BTreeMap, HashMap};
@@ -61,6 +63,8 @@ pub struct Qrels {
 pub struct RunEntry {
     pub docid: String,
     pub score: f64,
+    /// The written rank, when it is an integer. Never used for ranking.
+    pub rank: Option<i64>,
     pub line: usize,
 }
 
@@ -165,7 +169,7 @@ pub fn parse_run(text: &str, path: &str, format: Format) -> Result<Run> {
             continue;
         }
         let at = |msg: String| Error(format!("{path}:{lineno}: {msg}"));
-        let (qid, docid, score, line_tag) = match format {
+        let (qid, docid, score, rank, line_tag) = match format {
             Format::Jsonl => {
                 let v: Value =
                     serde_json::from_str(line).map_err(|e| at(format!("invalid JSON: {e}")))?;
@@ -179,7 +183,8 @@ pub fn parse_run(text: &str, path: &str, format: Format) -> Result<Run> {
                     None => return Err(at("missing \"score\"".into())),
                 };
                 let line_tag = v.get("tag").and_then(Value::as_str).map(str::to_string);
-                (qid, docid, score, line_tag)
+                let rank = v.get("rank").and_then(Value::as_i64);
+                (qid, docid, score, rank, line_tag)
             }
             _ => {
                 let fields: Vec<&str> = line.split_whitespace().collect();
@@ -196,6 +201,7 @@ pub fn parse_run(text: &str, path: &str, format: Format) -> Result<Run> {
                     fields[0].to_string(),
                     fields[2].to_string(),
                     score,
+                    fields[3].parse().ok(),
                     Some(fields[5].to_string()),
                 )
             }
@@ -209,6 +215,7 @@ pub fn parse_run(text: &str, path: &str, format: Format) -> Result<Run> {
         queries.entry(qid).or_default().push(RunEntry {
             docid,
             score,
+            rank,
             line: lineno,
         });
     }
